@@ -71,6 +71,35 @@ resource "aws_iam_role" "firehose_role" {
   })
 }
 
+# CloudWatch Log Groups
+resource "aws_cloudwatch_log_group" "api_gateway_logs" {
+  name              = "/aws/apigateway/senddatatofirehose"
+  retention_in_days = 7
+  
+  tags = {
+    Purpose = "Learning"
+  }
+}
+
+resource "aws_cloudwatch_log_group" "firehose_logs" {
+  name              = "/aws/kinesisfirehose/my-first-stream"
+  retention_in_days = 7
+  
+  tags = {
+    Purpose = "Learning"
+  }
+}
+
+resource "aws_cloudwatch_log_stream" "firehose_http_delivery" {
+  name           = "HttpEndpointDelivery"
+  log_group_name = aws_cloudwatch_log_group.firehose_logs.name
+}
+
+resource "aws_cloudwatch_log_stream" "firehose_s3_backup" {
+  name           = "S3Backup"
+  log_group_name = aws_cloudwatch_log_group.firehose_logs.name
+}
+
 resource "aws_iam_role_policy" "firehose_policy" {
   name = "firehose_delivery_policy"
   role = aws_iam_role.firehose_role.id
@@ -102,7 +131,10 @@ resource "aws_iam_role_policy" "firehose_policy" {
           "logs:CreateLogStream",
           "logs:PutLogEvents"
         ],
-        Resource = "*"
+        Resource = [
+          aws_cloudwatch_log_group.firehose_logs.arn,
+          "${aws_cloudwatch_log_group.firehose_logs.arn}:*"
+        ]
       }
     ]
   })
@@ -126,6 +158,13 @@ resource "aws_kinesis_firehose_delivery_stream" "my_first_stream" {
     }
 
     retry_duration = 60
+    
+    # Enable CloudWatch logging for HTTP endpoint delivery
+    cloudwatch_logging_options {
+      enabled         = true
+      log_group_name  = aws_cloudwatch_log_group.firehose_logs.name
+      log_stream_name = aws_cloudwatch_log_stream.firehose_http_delivery.name
+    }
 
     s3_configuration {
       role_arn           = aws_iam_role.firehose_role.arn
@@ -133,6 +172,13 @@ resource "aws_kinesis_firehose_delivery_stream" "my_first_stream" {
       buffering_size     = 1
       buffering_interval = 60
       compression_format = "UNCOMPRESSED"
+      
+      # Enable CloudWatch logging for S3 backup
+      cloudwatch_logging_options {
+        enabled         = true
+        log_group_name  = aws_cloudwatch_log_group.firehose_logs.name
+        log_stream_name = aws_cloudwatch_log_stream.firehose_s3_backup.name
+      }
     }
 
     # Optional: processing configuration to invoke Lambda for record transformation
@@ -222,17 +268,94 @@ resource "aws_api_gateway_method_response" "method_response_200" {
   resource_id = aws_api_gateway_rest_api.api.root_resource_id
   http_method = aws_api_gateway_method.post.http_method
   status_code = "200"
+  
+  response_models = {
+    "application/json" = "Empty"
+  }
+}
+
+resource "aws_api_gateway_integration_response" "integration_response_200" {
+  rest_api_id = aws_api_gateway_rest_api.api.id
+  resource_id = aws_api_gateway_rest_api.api.root_resource_id
+  http_method = aws_api_gateway_method.post.http_method
+  status_code = aws_api_gateway_method_response.method_response_200.status_code
+  
+  # Empty selection pattern = default (matches all successful responses)
+  selection_pattern = ""
+  
+  # Pass through Firehose PutRecord response (RecordId, Encrypted)
+  response_templates = {
+    "application/json" = "$input.json('$')"
+  }
+  
+  depends_on = [aws_api_gateway_integration.firehose_integration]
 }
 
 resource "aws_api_gateway_deployment" "deployment" {
-  depends_on = [aws_api_gateway_integration.firehose_integration]
+  depends_on = [
+    aws_api_gateway_integration.firehose_integration,
+    aws_api_gateway_integration_response.integration_response_200
+  ]
   rest_api_id = aws_api_gateway_rest_api.api.id
+}
+
+# IAM role for API Gateway CloudWatch logging
+resource "aws_iam_role" "api_gateway_cloudwatch_role" {
+  name = "api_gateway_cloudwatch_role"
+  
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "apigateway.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "api_gateway_cloudwatch_policy" {
+  role       = aws_iam_role.api_gateway_cloudwatch_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs"
+}
+
+# Set account-level CloudWatch logging for API Gateway
+resource "aws_api_gateway_account" "account" {
+  cloudwatch_role_arn = aws_iam_role.api_gateway_cloudwatch_role.arn
 }
 
 resource "aws_api_gateway_stage" "prod" {
   deployment_id = aws_api_gateway_deployment.deployment.id
   rest_api_id   = aws_api_gateway_rest_api.api.id
   stage_name    = "prod"
+  
+  # Enable access logging
+  access_log_settings {
+    destination_arn = aws_cloudwatch_log_group.api_gateway_logs.arn
+    format = jsonencode({
+      requestId        = "$context.requestId"
+      ip               = "$context.identity.sourceIp"
+      caller           = "$context.identity.caller"
+      user             = "$context.identity.user"
+      requestTime      = "$context.requestTime"
+      httpMethod       = "$context.httpMethod"
+      resourcePath     = "$context.resourcePath"
+      status           = "$context.status"
+      protocol         = "$context.protocol"
+      responseLength   = "$context.responseLength"
+      responseLatency  = "$context.responseLatency"
+      integrationError = "$context.integrationErrorMessage"
+      integrationStatus = "$context.integrationStatus"
+      integrationLatency = "$context.integration.latency"
+      errorMessage     = "$context.error.message"
+      errorType        = "$context.error.messageString"
+    })
+  }
+  
+  depends_on = [aws_api_gateway_account.account]
 }
 
 output "firehose_stream_name" {
@@ -249,4 +372,12 @@ output "api_invoke_url" {
 
 output "lambda_function_name" {
   value = aws_lambda_function.firehose_handler.function_name
+}
+
+output "api_gateway_log_group" {
+  value = aws_cloudwatch_log_group.api_gateway_logs.name
+}
+
+output "firehose_log_group" {
+  value = aws_cloudwatch_log_group.firehose_logs.name
 }
