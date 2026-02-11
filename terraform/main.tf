@@ -146,8 +146,8 @@ resource "aws_kinesis_firehose_delivery_stream" "my_first_stream" {
   destination = "http_endpoint"
 
   http_endpoint_configuration {
-    url                = "https://log-api.newrelic.com/log/v1"
-    name               = "newrelic-endpoint"
+    url                = "https://aws-api.newrelic.com/firehose/v1"
+    name               = "newrelic-firehose-endpoint"
     access_key         = "4f209aa9bf056bceed54d8f482c09aefFFFFNRAL"
     role_arn           = aws_iam_role.firehose_role.arn
     buffering_size     = 1
